@@ -4,12 +4,95 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:docshelf/main.dart';
 import 'package:docshelf/office.dart';
+import 'package:docshelf/shelf_settings.dart';
+import 'package:docshelf/shelf_store.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pdfrx/pdfrx.dart';
 
 void main() {
+  test(
+    'retains documents and preferences, then clears only the app copy',
+    () async {
+      final folder = Directory.systemTemp.createTempSync('docshelf-history-');
+      addTearDown(() => folder.deleteSync(recursive: true));
+      final original = File('${folder.path}/original.txt')
+        ..writeAsStringSync('note');
+      final store = ShelfStore(
+        directory: () async => Directory('${folder.path}/app'),
+      );
+      final settings = ShelfSettings(store);
+      addTearDown(settings.dispose);
+      final file = await store.retain(
+        PlatformFile(name: 'original.txt', size: 4, path: original.path),
+      );
+      await settings.remember(file);
+      await Future.wait([
+        settings.setTheme(ThemeMode.dark),
+        settings.setTextSize(22),
+      ]);
+      final reopened = ShelfSettings(store);
+      addTearDown(reopened.dispose);
+      await reopened.restore();
+      expect(reopened.theme, ThemeMode.dark);
+      expect(reopened.textSize, 22);
+      expect(reopened.recent.single.path, file.path);
+      await reopened.clearHistory();
+      expect(File(file.path!).existsSync(), isFalse);
+      expect(original.readAsStringSync(), 'note');
+      expect((await store.load())['recent'], isEmpty);
+    },
+  );
+
+  testWidgets('opens Settings and changes the app theme', (tester) async {
+    final folder = Directory.systemTemp.createTempSync('docshelf-settings-');
+    addTearDown(() => folder.deleteSync(recursive: true));
+    await tester.pumpWidget(
+      DocShelfApp(store: ShelfStore(directory: () async => folder)),
+    );
+    await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+    });
+    await tester.tap(find.byTooltip('Settings'));
+    await tester.pumpAndSettle();
+    expect(find.text('Reading text size'), findsOneWidget);
+    await tester.tap(find.text('Dark'));
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<MaterialApp>(find.byType(MaterialApp)).themeMode,
+      ThemeMode.dark,
+    );
+  });
+
+  test('reads representative Word, Excel and PowerPoint files', () {
+    List<PreviewPart> read(String format) => readOffice(
+      File('test/fixtures/sample.$format').readAsBytesSync(),
+      format,
+    );
+    final word = read('docx').single.blocks;
+    expect((word.first as Heading).text, 'Takardar gwaji');
+    expect(word[1], 'Layi na farko\nLayi na biyu');
+    expect(word[2], isA<Uint8List>());
+    expect(word[3], [
+      ['Suna', 'Adadi'],
+    ]);
+    final sheets = read('xlsx');
+    expect(sheets.map((part) => part.title), ['Summary', 'Details']);
+    expect(sheets.first.rows, [
+      [],
+      [],
+      ['', 'Jimilla', '=1+2'],
+    ]);
+    final slides = read('pptx');
+    expect(slides.first.blocks[0], 'Rahoton wata');
+    expect(slides.first.blocks[1], isA<Uint8List>());
+    expect(slides.first.blocks[2], [
+      ['Suna', 'Adadi'],
+    ]);
+    expect(slides.last.blocks.single, 'Ƙarshe');
+  });
+
   test('PDF engine opens a local one-page document', () async {
     final folder = Directory.systemTemp.createTempSync('docshelf-pdf-');
     addTearDown(() => folder.deleteSync(recursive: true));

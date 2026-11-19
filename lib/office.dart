@@ -17,6 +17,36 @@ Iterable<XmlElement> elements(XmlNode node, String name) =>
 String textRuns(XmlNode node) =>
     elements(node, 't').map((e) => e.innerText).join();
 
+class Heading {
+  const Heading(this.text);
+  final String text;
+}
+
+String wordText(XmlNode paragraph) => paragraph.descendants
+    .whereType<XmlElement>()
+    .map(
+      (node) => switch (node.name.local) {
+        't' => node.innerText,
+        'tab' => '\t',
+        'br' || 'cr' => '\n',
+        _ => '',
+      },
+    )
+    .join();
+
+List<List<String>> _table(
+  XmlElement table,
+  String row,
+  String cell,
+  String Function(XmlNode) text,
+) => [
+  for (final line in table.childElements.where((e) => e.name.local == row))
+    [
+      for (final entry in line.childElements.where((e) => e.name.local == cell))
+        elements(entry, 'p').map(text).join('\n'),
+    ],
+];
+
 List<PreviewPart> readOffice(Uint8List bytes, String extension) {
   final archive = ZipDecoder().decodeBytes(bytes);
   var expandedSize = 0;
@@ -58,16 +88,26 @@ List<PreviewPart> readOffice(Uint8List bytes, String extension) {
     final name = path.substring(slash + 1);
     final links = relationships('$folder/_rels/$name.rels');
     final blocks = <Object>[];
-    for (final node in xml(path).descendants.whereType<XmlElement>()) {
-      if (node.name.local == 'p') {
-        final text = textRuns(node);
-        if (text.trim().isNotEmpty) blocks.add(text);
-      } else if (node.name.local == 'blip') {
-        final imagePath = target(folder, links[relationshipId(node, 'embed')]);
-        final content = files[imagePath]?.content;
-        if (content != null) blocks.add(Uint8List.fromList(content));
+    void visit(XmlElement node) {
+      switch (node.name.local) {
+        case 'tbl':
+          blocks.add(_table(node, 'tr', 'tc', textRuns));
+        case 'p':
+          final text = textRuns(node);
+          if (text.trim().isNotEmpty) blocks.add(text);
+        case 'blip':
+          final imagePath = target(
+            folder,
+            links[relationshipId(node, 'embed')],
+          );
+          final content = files[imagePath]?.content;
+          if (content != null) blocks.add(Uint8List.fromList(content));
+        default:
+          node.childElements.forEach(visit);
       }
     }
+
+    visit(xml(path).rootElement);
     return blocks;
   }
 
@@ -78,18 +118,18 @@ List<PreviewPart> readOffice(Uint8List bytes, String extension) {
       final blocks = <Object>[];
       for (final node in body.childElements) {
         if (node.name.local == 'tbl') {
-          blocks.add([
-            for (final row in elements(node, 'tr'))
-              [
-                for (final cell in row.childElements.where(
-                  (e) => e.name.local == 'tc',
-                ))
-                  elements(cell, 'p').map(textRuns).join('\n'),
-              ],
-          ]);
+          blocks.add(_table(node, 'tr', 'tc', wordText));
         } else if (node.name.local == 'p') {
-          final paragraph = textRuns(node);
-          if (paragraph.trim().isNotEmpty) blocks.add(paragraph);
+          final paragraph = wordText(node);
+          final style = elements(node, 'pStyle').firstOrNull?.attributes
+              .where((attr) => attr.name.local == 'val')
+              .firstOrNull
+              ?.value;
+          if (paragraph.trim().isNotEmpty) {
+            final heading =
+                style == 'Title' || (style?.startsWith('Heading') ?? false);
+            blocks.add(heading ? Heading(paragraph) : paragraph);
+          }
           for (final image in elements(node, 'blip')) {
             final path = target('word', links[relationshipId(image, 'embed')]);
             final content = files[path]?.content;
@@ -109,10 +149,7 @@ List<PreviewPart> readOffice(Uint8List bytes, String extension) {
               case final String path)
             PreviewPart(
               sheet.getAttribute('name') ?? 'Sheet',
-              rows: [
-                for (final row in elements(xml(path), 'row'))
-                  _sheetRow(row, strings),
-              ],
+              rows: _sheetRows(elements(xml(path), 'row'), strings),
             ),
       ];
     case 'pptx':
@@ -127,6 +164,24 @@ List<PreviewPart> readOffice(Uint8List bytes, String extension) {
     default:
       throw const FormatException('Unsupported Office format');
   }
+}
+
+List<List<String>> _sheetRows(
+  Iterable<XmlElement> elements,
+  List<String> strings,
+) {
+  final rows = <List<String>>[];
+  for (final row in elements) {
+    final number = int.tryParse(row.getAttribute('r') ?? '');
+    if (number != null && number > 1048576) {
+      throw const FormatException('Invalid spreadsheet row');
+    }
+    while (number != null && rows.length + 1 < number) {
+      rows.add(const []);
+    }
+    rows.add(_sheetRow(row, strings));
+  }
+  return rows;
 }
 
 List<String> _sheetRow(XmlElement row, List<String> strings) {
@@ -145,11 +200,14 @@ List<String> _sheetRow(XmlElement row, List<String> strings) {
     }
     final raw = elements(cell, 'v').firstOrNull?.innerText ?? '';
     final index = int.tryParse(raw);
+    final formula = elements(cell, 'f').firstOrNull?.innerText;
     values.add(switch (cell.getAttribute('t')) {
       'inlineStr' => textRuns(cell),
       's' when index != null && index >= 0 && index < strings.length =>
         strings[index],
       'b' => raw == '1' ? 'TRUE' : 'FALSE',
+      _ when raw.isEmpty && formula != null && formula.isNotEmpty =>
+        '=$formula',
       _ => raw,
     });
   }

@@ -1,14 +1,18 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:csv/csv.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:two_dimensional_scrollables/two_dimensional_scrollables.dart';
 
 import 'office.dart';
+import 'shelf_settings.dart';
+import 'shelf_store.dart';
 
 const navy = Color(0xff14213d);
 const teal = Color(0xff2dd4bf);
@@ -18,45 +22,142 @@ const formats = ['pdf', 'docx', 'xlsx', 'pptx', 'txt', 'csv'];
 
 void main() => runApp(const DocShelfApp());
 
-class DocShelfApp extends StatelessWidget {
-  const DocShelfApp({super.key});
+class DocShelfApp extends StatefulWidget {
+  const DocShelfApp({super.key, this.store});
+  final ShelfStore? store;
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    title: 'DocShelf',
-    debugShowCheckedModeBanner: false,
-    theme: ThemeData(
-      colorScheme: ColorScheme.fromSeed(
-        seedColor: navy,
-        surface: paper,
-        onSurface: navy,
-      ),
-      scaffoldBackgroundColor: paper,
-      appBarTheme: const AppBarTheme(
-        backgroundColor: paper,
-        foregroundColor: navy,
+  State<DocShelfApp> createState() => _DocShelfAppState();
+}
+
+class _DocShelfAppState extends State<DocShelfApp> {
+  late final settings = ShelfSettings(widget.store ?? ShelfStore());
+  late final ready = settings.restore();
+
+  @override
+  void dispose() {
+    settings.dispose();
+    super.dispose();
+  }
+
+  ThemeData theme(Brightness brightness) {
+    final scheme = ColorScheme.fromSeed(
+      seedColor: brightness == Brightness.light ? navy : teal,
+      brightness: brightness,
+      surface: brightness == Brightness.light ? paper : const Color(0xff101827),
+    );
+    return ThemeData(
+      colorScheme: scheme,
+      scaffoldBackgroundColor: scheme.surface,
+      appBarTheme: AppBarTheme(
+        backgroundColor: scheme.surface,
+        foregroundColor: scheme.onSurface,
       ),
       useMaterial3: true,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: settings,
+    builder: (context, _) => MaterialApp(
+      title: 'DocShelf',
+      debugShowCheckedModeBanner: false,
+      theme: theme(Brightness.light),
+      darkTheme: theme(Brightness.dark),
+      themeMode: settings.theme,
+      home: Shelf(settings: settings, ready: ready),
     ),
-    home: const Shelf(),
   );
 }
 
 class Shelf extends StatefulWidget {
-  const Shelf({super.key});
+  const Shelf({super.key, required this.settings, required this.ready});
+  final ShelfSettings settings;
+  final Future<void> ready;
 
   @override
   State<Shelf> createState() => _ShelfState();
 }
 
 class _ShelfState extends State<Shelf> {
-  final recent = <PlatformFile>[];
+  static const incoming = MethodChannel('docshelf/documents');
+  ShelfSettings get settings => widget.settings;
+  List<PlatformFile> get recent => settings.recent;
+  bool draining = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (Platform.isAndroid || Platform.isIOS) {
+      incoming.setMethodCallHandler((call) async {
+        if (call.method == 'documentAvailable') unawaited(drainIncoming());
+      });
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => unawaited(drainIncoming()),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    if (Platform.isAndroid || Platform.isIOS) {
+      incoming.setMethodCallHandler(null);
+    }
+    super.dispose();
+  }
+
+  void showError(String message) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> drainIncoming() async {
+    if (opening || draining || !mounted) return;
+    draining = true;
+    try {
+      while (mounted && !opening) {
+        final data = await incoming.invokeMapMethod<String, dynamic>(
+          'takeDocument',
+        );
+        if (data == null || !mounted) return;
+        final error = data['error'];
+        if (error is String) {
+          showError(error);
+          continue;
+        }
+        final path = data['path'] as String;
+        try {
+          await open(
+            PlatformFile(
+              name: data['name'] as String,
+              size: data['size'] as int,
+              path: path,
+            ),
+          );
+        } finally {
+          try {
+            await File(path).delete();
+          } on FileSystemException {
+            // The import staging file may already have been removed by the OS.
+          }
+        }
+      }
+    } on MissingPluginException {
+      // This platform has no external document handler.
+    } finally {
+      draining = false;
+    }
+  }
+
   bool opening = false;
 
   Future<void> open([PlatformFile? file]) async {
-    if (opening) return;
+    if (opening || (draining && file == null)) return;
     setState(() => opening = true);
     try {
+      await widget.ready;
+      if (!mounted) return;
       final selected =
           file ??
           (await FilePicker.platform.pickFiles(
@@ -70,17 +171,25 @@ class _ShelfState extends State<Shelf> {
         throw const FormatException();
       }
       if (!await File(path).exists()) throw const FileSystemException();
+      if (await File(path).length() > ShelfStore.maxFileSize) {
+        if (mounted) showError('Choose a document under 100 MB.');
+        return;
+      }
       final preview = extension == 'pdf'
           ? null
           : await compute(loadPreview, (path, extension));
       if (!mounted) return;
-      setState(() {
-        recent.removeWhere((item) => item.path == path);
-        recent.insert(0, selected);
-      });
+      final retained = await settings.store.retain(selected);
+      if (!mounted) return;
+      await settings.remember(retained);
+      if (!mounted) return;
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
-          builder: (context) => Reader(file: selected, preview: preview),
+          builder: (context) => Reader(
+            file: retained,
+            preview: preview,
+            textSize: settings.textSize,
+          ),
         ),
       );
     } catch (_) {
@@ -92,7 +201,10 @@ class _ShelfState extends State<Shelf> {
         );
       }
     } finally {
-      if (mounted) setState(() => opening = false);
+      if (mounted) {
+        setState(() => opening = false);
+        if (Platform.isAndroid || Platform.isIOS) unawaited(drainIncoming());
+      }
     }
   }
 
@@ -116,6 +228,24 @@ class _ShelfState extends State<Shelf> {
                           'DocShelf',
                           style: Theme.of(context).textTheme.titleLarge
                               ?.copyWith(fontWeight: FontWeight.w800),
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          tooltip: 'Settings',
+                          onPressed: opening
+                              ? null
+                              : () async {
+                                  await widget.ready;
+                                  if (context.mounted && !opening) {
+                                    await Navigator.of(context).push(
+                                      MaterialPageRoute<void>(
+                                        builder: (context) =>
+                                            SettingsPage(settings),
+                                      ),
+                                    );
+                                  }
+                                },
+                          icon: const Icon(Icons.settings_outlined),
                         ),
                       ],
                     ),
@@ -183,16 +313,22 @@ class _ShelfState extends State<Shelf> {
                               vertical: 6,
                             ),
                             decoration: BoxDecoration(
-                              color: Colors.white,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .surfaceContainerLow,
                               border: Border.all(
-                                color: const Color(0xffdde5ee),
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .outlineVariant,
                               ),
                               borderRadius: BorderRadius.circular(8),
                             ),
                             child: Text(
                               format.toUpperCase(),
-                              style: const TextStyle(
-                                color: slate,
+                              style: TextStyle(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSurfaceVariant,
                                 fontSize: 12,
                                 fontWeight: FontWeight.w700,
                               ),
@@ -211,18 +347,32 @@ class _ShelfState extends State<Shelf> {
                       Container(
                         padding: const EdgeInsets.all(24),
                         decoration: BoxDecoration(
-                          color: Colors.white,
-                          border: Border.all(color: const Color(0xffdde5ee)),
+                          color: Theme.of(context)
+                              .colorScheme
+                              .surfaceContainerLow,
+                          border: Border.all(
+                            color: Theme.of(context).colorScheme.outlineVariant,
+                          ),
                           borderRadius: BorderRadius.circular(20),
                         ),
-                        child: const Row(
+                        child: Row(
                           children: [
-                            Icon(Icons.history_rounded, color: slate),
-                            SizedBox(width: 14),
+                            Icon(
+                              Icons.history_rounded,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurfaceVariant,
+                            ),
+                            const SizedBox(width: 14),
                             Expanded(
                               child: Text(
-                                'Files you open will appear here during this session.',
-                                style: TextStyle(color: slate, height: 1.4),
+                                'Files you open will appear here.',
+                                style: TextStyle(
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurfaceVariant,
+                                  height: 1.4,
+                                ),
                               ),
                             ),
                           ],
@@ -238,7 +388,7 @@ class _ShelfState extends State<Shelf> {
                   itemBuilder: (context, index) {
                     final file = recent[index];
                     return Card(
-                      color: Colors.white,
+                      color: Theme.of(context).colorScheme.surfaceContainerLow,
                       elevation: 0,
                       margin: const EdgeInsets.only(bottom: 8),
                       child: ListTile(
@@ -300,9 +450,15 @@ List<PreviewPart> loadPreview((String, String) file) {
 }
 
 class Reader extends StatefulWidget {
-  const Reader({super.key, required this.file, required this.preview});
+  const Reader({
+    super.key,
+    required this.file,
+    required this.preview,
+    this.textSize = 17,
+  });
   final PlatformFile file;
   final List<PreviewPart>? preview;
+  final double textSize;
 
   @override
   State<Reader> createState() => _ReaderState();
@@ -421,10 +577,18 @@ class _ReaderState extends State<Reader> {
                                   ),
                                   child: TablePreview(rows: rows),
                                 ),
+                                final Heading heading => SelectableText(
+                                  heading.text,
+                                  style: TextStyle(
+                                    fontSize: widget.textSize + 6,
+                                    fontWeight: FontWeight.w700,
+                                    height: 1.3,
+                                  ),
+                                ),
                                 final String text => SelectableText(
                                   text,
-                                  style: const TextStyle(
-                                    fontSize: 17,
+                                  style: TextStyle(
+                                    fontSize: widget.textSize,
                                     height: 1.55,
                                   ),
                                 ),
@@ -465,9 +629,12 @@ class TablePreview extends StatelessWidget {
             padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(
               color: vicinity.row.isEven
-                  ? Colors.white
-                  : const Color(0xffedf3f8),
-              border: Border.all(color: const Color(0xffdce5ed), width: 0.5),
+                  ? Theme.of(context).colorScheme.surfaceContainerLowest
+                  : Theme.of(context).colorScheme.surfaceContainerLow,
+              border: Border.all(
+                color: Theme.of(context).colorScheme.outlineVariant,
+                width: 0.5,
+              ),
             ),
             child: SelectableText(value, maxLines: 1),
           ),
