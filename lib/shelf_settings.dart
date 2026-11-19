@@ -72,6 +72,11 @@ class ShelfSettings extends ChangeNotifier {
     );
   }
 
+  Future<void> forget(PlatformFile file) {
+    recent = recent.where((entry) => entry.path != file.path).toList();
+    return _save(removed: [file]);
+  }
+
   Future<void> clearHistory() {
     final previous = recent;
     recent = [];

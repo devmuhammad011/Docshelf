@@ -15,6 +15,12 @@ The library retains up to 20 recently opened documents as app-private copies so 
 
 Office previews preserve readable content. Page breaks, exact slide positioning, Excel styles/charts and animations are outside the current renderer. The legacy DOC, XLS and PPT formats use different binary structures from the ZIP/XML-based Office formats. Supporting them offline would require a separate mobile reader or converter. Convert those files to DOCX, XLSX, PPTX or PDF before opening in DocShelf.
 
+## Edit and export
+
+Long-press a recent file or tap its three-dot menu to edit supported files, share them, save a copy, or remove the copy kept by DocShelf.
+
+Tap the pencil in the reader to edit TXT text, CSV source, existing Word or PowerPoint text, or existing Excel cells. **Save As** opens the system picker to choose the destination and filename. The editor writes a separate file in the original format. Office edits preserve the surrounding XML document structure and media. Editing page layout, inserting Office objects, adding spreadsheet cells, and editing PDF are outside this editor. Spreadsheet formulas are recalculated by a spreadsheet app on open.
+
 ## Run locally
 
 Use Flutter 3.50 or later with the Android or iOS toolchain.

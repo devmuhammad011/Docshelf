@@ -1,7 +1,7 @@
 name: docshelf
 description: An offline reader for documents, spreadsheets and slides.
 publish_to: none
-version: 0.2.0+2
+version: 0.3.0+3
 
 environment:
   sdk: ^3.14.0
@@ -16,6 +16,7 @@ dependencies:
   material_ui: ^1.11.1
   path_provider: ^2.1.6
   pdfrx: ^3.0.2
+  share_plus: ^12.0.2
   two_dimensional_scrollables: ^0.5.6
   xml: ^6.6.1
 

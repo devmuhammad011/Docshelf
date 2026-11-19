@@ -1,7 +1,9 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:docshelf/document_editor.dart';
 import 'package:docshelf/main.dart';
 import 'package:docshelf/office.dart';
 import 'package:docshelf/shelf_settings.dart';
@@ -11,7 +13,92 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pdfrx/pdfrx.dart';
 
+class _SavePicker extends FilePicker {
+  (String?, Uint8List?)? request;
+
+  @override
+  Future<String?> saveFile({
+    String? dialogTitle,
+    String? fileName,
+    String? initialDirectory,
+    FileType type = FileType.any,
+    List<String>? allowedExtensions,
+    Uint8List? bytes,
+    bool lockParentWindow = false,
+  }) async {
+    request = (fileName, bytes);
+    return null;
+  }
+}
+
 void main() {
+  testWidgets('Save As sends edited bytes and keeps changes if canceled', (
+    tester,
+  ) async {
+    final folder = Directory.systemTemp.createTempSync('docshelf-edit-page');
+    addTearDown(() => folder.deleteSync(recursive: true));
+    final original = File('${folder.path}/note.txt')
+      ..writeAsStringSync('before');
+    final picker = _SavePicker();
+    FilePicker.platform = picker;
+    await tester.runAsync(() async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: DocumentEditor(
+            file: PlatformFile(name: 'note.txt', path: original.path, size: 6),
+          ),
+        ),
+      );
+      final field = find.byType(TextFormField);
+      for (
+        var attempt = 0;
+        attempt < 40 && field.evaluate().isEmpty;
+        attempt++
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 25));
+        await tester.pump();
+      }
+      expect(field, findsOneWidget);
+      await tester.enterText(field, 'Ƙarin rubutu');
+      await tester.pump();
+      final button = find.widgetWithText(TextButton, 'Save As');
+      expect(tester.widget<TextButton>(button).onPressed, isNotNull);
+      await tester.tap(button);
+      for (var attempt = 0; attempt < 80 && picker.request == null; attempt++) {
+        await Future<void>.delayed(const Duration(milliseconds: 25));
+        await tester.pump();
+      }
+      expect(picker.request, isNotNull);
+      final (name, bytes) = picker.request!;
+      expect(name, 'note-edited.txt');
+      expect(utf8.decode(bytes!), 'Ƙarin rubutu');
+    });
+    await tester.pumpAndSettle();
+    expect(find.text('Ƙarin rubutu'), findsOneWidget);
+    expect(original.readAsStringSync(), 'before');
+  });
+
+  testWidgets('long-press opens recent file actions', (tester) async {
+    final settings = ShelfSettings(ShelfStore());
+    addTearDown(settings.dispose);
+    settings.recent = [
+      PlatformFile(name: 'example.docx', size: 100, path: '/example.docx'),
+    ];
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Shelf(settings: settings, ready: Future.value()),
+      ),
+    );
+    await tester.ensureVisible(find.text('example.docx'));
+    await tester.longPress(find.text('example.docx'));
+    await tester.pumpAndSettle();
+    expect(find.text('Share'), findsOneWidget);
+    expect(find.text('Save a copy'), findsOneWidget);
+    await tester.tap(find.text('Remove from recent'));
+    await tester.pumpAndSettle();
+    expect(find.text('Remove from recent?'), findsOneWidget);
+  });
+
   test(
     'retains documents and preferences, then clears only the app copy',
     () async {

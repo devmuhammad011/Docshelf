@@ -8,8 +8,11 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:pdfrx/pdfrx.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:two_dimensional_scrollables/two_dimensional_scrollables.dart';
 
+import 'document_edit.dart';
+import 'document_editor.dart';
 import 'office.dart';
 import 'shelf_settings.dart';
 import 'shelf_store.dart';
@@ -80,6 +83,8 @@ class Shelf extends StatefulWidget {
   State<Shelf> createState() => _ShelfState();
 }
 
+enum RecentAction { edit, share, saveCopy, remove }
+
 class _ShelfState extends State<Shelf> {
   static const incoming = MethodChannel('docshelf/documents');
   ShelfSettings get settings => widget.settings;
@@ -113,10 +118,10 @@ class _ShelfState extends State<Shelf> {
   }
 
   Future<void> drainIncoming() async {
-    if (opening || draining || !mounted) return;
+    if (opening || managing || draining || !mounted) return;
     draining = true;
     try {
-      while (mounted && !opening) {
+      while (mounted && !opening && !managing) {
         final data = await incoming.invokeMapMethod<String, dynamic>(
           'takeDocument',
         );
@@ -151,9 +156,114 @@ class _ShelfState extends State<Shelf> {
   }
 
   bool opening = false;
+  bool managing = false;
+
+  Future<void> manage(PlatformFile file) async {
+    if (opening || managing) return;
+    setState(() => managing = true);
+    try {
+      final action = await showModalBottomSheet<RecentAction>(
+        context: context,
+        showDragHandle: true,
+        builder: (context) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                ListTile(
+                  title: Text(
+                    file.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (editableFormats.contains(file.extension?.toLowerCase()))
+                  ListTile(
+                    leading: const Icon(Icons.edit_outlined),
+                    title: const Text('Edit'),
+                    onTap: () => Navigator.pop(context, RecentAction.edit),
+                  ),
+                ListTile(
+                  leading: const Icon(Icons.share_outlined),
+                  title: const Text('Share'),
+                  onTap: () => Navigator.pop(context, RecentAction.share),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.save_alt_rounded),
+                  title: const Text('Save a copy'),
+                  onTap: () => Navigator.pop(context, RecentAction.saveCopy),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.delete_outline_rounded),
+                  title: const Text('Remove from recent'),
+                  onTap: () => Navigator.pop(context, RecentAction.remove),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      if (!mounted || action == null) return;
+      switch (action) {
+        case RecentAction.edit:
+          await Navigator.of(context).push(
+            MaterialPageRoute<void>(builder: (_) => DocumentEditor(file: file)),
+          );
+        case RecentAction.share:
+          final box = context.findRenderObject();
+          await SharePlus.instance.share(
+            ShareParams(
+              files: [XFile(file.path!)],
+              fileNameOverrides: [file.name],
+              sharePositionOrigin: box is RenderBox && box.hasSize
+                  ? box.localToGlobal(Offset.zero) & box.size
+                  : null,
+            ),
+          );
+        case RecentAction.saveCopy:
+          final bytes = await File(file.path!).readAsBytes();
+          if (!mounted) return;
+          final saved = await FilePicker.platform.saveFile(
+            dialogTitle: 'Save a copy',
+            fileName: file.name,
+            bytes: bytes,
+          );
+          if (mounted && saved != null) showError('Copy saved.');
+        case RecentAction.remove:
+          final confirmed = await showDialog<bool>(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: const Text('Remove from recent?'),
+              content: const Text(
+                'This removes the copy stored by DocShelf. Your original stays where it is.',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Remove'),
+                ),
+              ],
+            ),
+          );
+          if (mounted && confirmed == true) await settings.forget(file);
+      }
+    } catch (_) {
+      if (mounted) showError('Couldn’t complete this file action.');
+    } finally {
+      if (mounted) {
+        setState(() => managing = false);
+        if (Platform.isAndroid || Platform.isIOS) unawaited(drainIncoming());
+      }
+    }
+  }
 
   Future<void> open([PlatformFile? file]) async {
-    if (opening || (draining && file == null)) return;
+    if (opening || managing || (draining && file == null)) return;
     setState(() => opening = true);
     try {
       await widget.ready;
@@ -394,6 +504,7 @@ class _ShelfState extends State<Shelf> {
                       child: ListTile(
                         enabled: !opening,
                         onTap: () => open(file),
+                        onLongPress: opening ? null : () => manage(file),
                         leading: const Icon(Icons.description_outlined),
                         title: Text(
                           file.name,
@@ -401,7 +512,13 @@ class _ShelfState extends State<Shelf> {
                           overflow: TextOverflow.ellipsis,
                         ),
                         subtitle: Text(file.extension?.toUpperCase() ?? ''),
-                        trailing: const Icon(Icons.chevron_right_rounded),
+                        trailing: IconButton(
+                          tooltip: 'File actions',
+                          icon: const Icon(Icons.more_vert),
+                          onPressed: opening || managing
+                              ? null
+                              : () => manage(file),
+                        ),
                       ),
                     );
                   },
@@ -474,6 +591,19 @@ class _ReaderState extends State<Reader> {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.file.name, overflow: TextOverflow.ellipsis),
+        actions: [
+          if (widget.file.path != null &&
+              editableFormats.contains(widget.file.extension?.toLowerCase()))
+            IconButton(
+              tooltip: 'Edit document',
+              icon: const Icon(Icons.edit_outlined),
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => DocumentEditor(file: widget.file),
+                ),
+              ),
+            ),
+        ],
       ),
       body: SafeArea(
         top: false,
